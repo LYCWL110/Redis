@@ -11,7 +11,8 @@
 #include<fcntl.h>
 #include<errno.h>
 #include<vector>
-#include<map>
+#include<cstdlib>
+#include<cstddef>
 #include<string>
 
 const size_t k_max_msg =  4096;
@@ -59,10 +60,17 @@ static void state_res(Conn *conn);
 static bool try_fill_buffer(Conn *conn);
 static bool try_one_request(Conn *conn);
 static bool try_flush_buffer(Conn *conn);
+struct HNode;
+
 static int32_t do_request(const uint8_t *req, uint32_t reqlen,
         uint32_t *rescode, uint8_t *res, uint32_t *reslen);
 static int32_t parse_req(const uint8_t *data, size_t len,
         std::vector<std::string> &out);
+static bool entry_eq(HNode *lhs, HNode *rhs);
+static uint64_t str_hash(const uint8_t *data, size_t len);
+static uint32_t do_get(std::vector<std::string> &cmd, uint8_t *res, uint32_t *reslen);
+static uint32_t do_set(std::vector<std::string> &cmd, uint8_t *res, uint32_t *reslen);
+static uint32_t do_del(std::vector<std::string> &cmd, uint8_t *res, uint32_t *reslen);
 
 static void msg(const char *s) {
     std::cout << s << "\n";
@@ -195,15 +203,180 @@ enum {
     RES_NX = 2,
 };
 
-static std::map<std::string, std::string> g_map;
+#define container_of(ptr, type, member) ({                              \
+    const decltype(((type *)0)->member) *mptr = (ptr);                  \
+    (type *)((char *)mptr - offsetof(type, member));                    \
+})
+
+static uint64_t str_hash(const uint8_t *data, size_t len) {
+    uint64_t h = 0x811C9DC5;
+    for (size_t i = 0; i < len; i++) {
+        h = (h + data[i]) * 0x01000193;
+    }
+    return h;
+}
+
+struct HNode {
+    HNode *next = NULL;
+    uint64_t hcode = 0;
+};
+
+struct HTab {
+    HNode **tab = NULL;
+    size_t mask = 0;
+    size_t size = 0;
+};
+
+struct HMap {
+    HTab ht1;
+    HTab ht2;
+    size_t resizing_pos = 0;
+};
+
+static void h_init(HTab *htab, size_t n) {
+    assert(n > 0 && ((n - 1) & n) == 0);
+    htab->tab = (HNode **)calloc(n, sizeof(HNode *));
+    htab->mask = n - 1;
+    htab->size = 0;
+}
+
+static void h_insert(HTab *htab, HNode *node) {
+    size_t pos = node->hcode & htab->mask;
+    HNode *next = htab->tab[pos];
+    node->next = next;
+    htab->tab[pos] = node;
+    htab->size++;
+}
+
+static HNode **h_lookup(
+    HTab *htab, HNode *key, bool (*cmp)(HNode *, HNode *))
+{
+    if (!htab->tab) {
+        return NULL;
+    }
+
+    size_t pos = key->hcode & htab->mask;
+    HNode **from = &htab->tab[pos];
+    while (*from) {
+        if (cmp(*from, key)) {
+            return from;
+        }
+        from = &(*from)->next;
+    }
+    return NULL;
+}
+
+static HNode *h_detach(HTab *htab, HNode **from) {
+    HNode *node = *from;
+    *from = (*from)->next;
+    htab->size--;
+    return node;
+}
+
+const size_t k_resizing_work = 128;
+const size_t k_max_load_factor = 8;
+
+static void hm_start_resizing(HMap *hmap) {
+    assert(hmap->ht2.tab == NULL);
+    hmap->ht2 = hmap->ht1;
+    h_init(&hmap->ht1, (hmap->ht1.mask + 1) * 2);
+    hmap->resizing_pos = 0;
+}
+
+static void hm_help_resizing(HMap *hmap) {
+    if (hmap->ht2.tab == NULL) {
+        return;
+    }
+
+    size_t nwork = 0;
+    while (nwork < k_resizing_work && hmap->ht2.size > 0) {
+        HNode **from = &hmap->ht2.tab[hmap->resizing_pos];
+        if (!*from) {
+            hmap->resizing_pos++;
+            continue;
+        }
+
+        h_insert(&hmap->ht1, h_detach(&hmap->ht2, from));
+        nwork++;
+    }
+
+    if (hmap->ht2.size == 0) {
+        free(hmap->ht2.tab);
+        hmap->ht2 = HTab{};
+    }
+}
+
+HNode *hm_lookup(
+    HMap *hmap, HNode *key, bool (*cmp)(HNode *, HNode *))
+{
+    hm_help_resizing(hmap);
+    HNode **from = h_lookup(&hmap->ht1, key, cmp);
+    if (!from) {
+        from = h_lookup(&hmap->ht2, key, cmp);
+    }
+    return from ? *from : NULL;
+}
+
+void hm_insert(HMap *hmap, HNode *node) {
+    if (!hmap->ht1.tab) {
+        h_init(&hmap->ht1, 4);
+    }
+
+    h_insert(&hmap->ht1, node);
+
+    if (!hmap->ht2.tab) {
+        size_t load_factor = hmap->ht1.size / (hmap->ht1.mask + 1);
+        if (load_factor >= k_max_load_factor) {
+            hm_start_resizing(hmap);
+        }
+    }
+    hm_help_resizing(hmap);
+}
+
+HNode *hm_pop(
+    HMap *hmap, HNode *key, bool (*cmp)(HNode *, HNode *))
+{
+    hm_help_resizing(hmap);
+    HNode **from = h_lookup(&hmap->ht1, key, cmp);
+    if (from) {
+        return h_detach(&hmap->ht1, from);
+    }
+    from = h_lookup(&hmap->ht2, key, cmp);
+    if (from) {
+        return h_detach(&hmap->ht2, from);
+    }
+    return NULL;
+}
+
+struct Entry {
+    struct HNode node;
+    std::string key;
+    std::string val;
+};
+
+static struct {
+    HMap db;
+} g_data;
+
+static bool entry_eq(HNode *lhs, HNode *rhs) {
+    struct Entry *le = container_of(lhs, struct Entry, node);
+    struct Entry *re = container_of(rhs, struct Entry, node);
+    return lhs->hcode == rhs->hcode && le->key == re->key;
+}
 
 static uint32_t do_get(
-    const std::vector<std::string> &cmd, uint8_t *res, uint32_t *reslen)
+    std::vector<std::string> &cmd, uint8_t *res, uint32_t *reslen)
 {
-    if (!g_map.count(cmd[1])) {
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (!node) {
         return RES_NX;
     }
-    std::string &val = g_map[cmd[1]];
+
+    const std::string &val = container_of(node, Entry, node)->val;
     assert(val.size() <= k_max_msg);
     memcpy(res, val.data(), val.size());
     *reslen = (uint32_t)val.size();
@@ -211,20 +384,42 @@ static uint32_t do_get(
 }
 
 static uint32_t do_set(
-    const std::vector<std::string> &cmd, uint8_t *res, uint32_t *reslen)
+    std::vector<std::string> &cmd, uint8_t *res, uint32_t *reslen)
 {
     (void)res;
     (void)reslen;
-    g_map[cmd[1]] = cmd[2];
+
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (node) {
+        container_of(node, Entry, node)->val.swap(cmd[2]);
+    } else {
+        Entry *ent = new Entry();
+        ent->key.swap(key.key);
+        ent->node.hcode = key.node.hcode;
+        ent->val.swap(cmd[2]);
+        hm_insert(&g_data.db, &ent->node);
+    }
     return RES_OK;
 }
 
 static uint32_t do_del(
-    const std::vector<std::string> &cmd, uint8_t *res, uint32_t *reslen)
+    std::vector<std::string> &cmd, uint8_t *res, uint32_t *reslen)
 {
     (void)res;
     (void)reslen;
-    g_map.erase(cmd[1]);
+
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+
+    HNode *node = hm_pop(&g_data.db, &key.node, &entry_eq);
+    if (node) {
+        delete container_of(node, Entry, node);
+    }
     return RES_OK;
 }
 
