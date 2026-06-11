@@ -7,25 +7,31 @@
 #include<sys/uio.h>
 #include<string.h>
 #include<assert.h>
+#include<vector>
+#include<string>
 const size_t k_max_msg =  4096;
 
 static int32_t read_full(int fd, char *buf, size_t n);
 static int32_t write_all(int fd, const char *buf, size_t n);
 
-static int32_t send_req(int fd, const char *text) {
-    uint32_t len = (uint32_t)strlen(text);
-    if (len > k_max_msg) {
-        return -1;
+static int32_t send_req(int fd, const std::vector<std::string> &cmd) {
+    uint32_t n = cmd.size();
+    // 先构造 body（不含外层总长帧头）
+    char body[4 + k_max_msg];
+    memcpy(&body[0], &n, 4);
+    size_t body_len = 4;
+    for (const std::string &s : cmd) {
+        uint32_t sz = s.size();
+        memcpy(&body[body_len], &sz, 4);
+        body_len += 4;
+        memcpy(&body[body_len], s.data(), sz);
+        body_len += sz;
     }
-
+    // 包上外层总长帧头
     char wbuf[4 + k_max_msg];
-    memcpy(wbuf, &len, 4);
-    memcpy(&wbuf[4], text, len);
-
-    if (int32_t err = write_all(fd, wbuf, 4 + len)) {
-        return err;
-    }
-    return 0;
+    memcpy(&wbuf[0], &body_len, 4);
+    memcpy(&wbuf[4], body, body_len);
+    return write_all(fd, wbuf, 4 + body_len);
 }
 
 static int32_t read_res(int fd) {
@@ -41,20 +47,23 @@ static int32_t read_res(int fd) {
         return err;
     }
 
-    uint32_t len = 0;
-    memcpy(&len, rbuf, 4);
-    if (len > k_max_msg) {
+    uint32_t wlen = 0;
+    memcpy(&wlen, rbuf, 4);
+    if (wlen > k_max_msg) {
         std::cout << "too long\n";
         return -1;
     }
 
-    err = read_full(fd, &rbuf[4], len);
+    err = read_full(fd, &rbuf[4], wlen);
     if (err) {
         std::cout << "read() error\n";
         return err;
     }
-    rbuf[4 + len] = '\0';
-    printf("server says: %s\n", &rbuf[4]);
+
+    uint32_t rescode = 0;
+    memcpy(&rescode, &rbuf[4], 4);
+    uint32_t datalen = wlen - 4;
+    printf("server says: [%u] %.*s\n", rescode, datalen, &rbuf[8]);
     return 0;
 }
 
@@ -72,19 +81,35 @@ int main(){
         std::cout<<"connect"<<"\n";
     }
 
-    // 多个流水线请求
-    const char *query_list[3] = {"hello1", "hello2", "hello3"};
-    for (size_t i = 0; i < 3; ++i) {
-        int32_t err = send_req(clntfd, query_list[i]);
-        if (err) {
-            goto L_DONE;
-        }
+    // set k1 v1
+    {
+        int32_t err = send_req(clntfd, {"set", "k1", "v1"});
+        if (err) goto L_DONE;
     }
-    for (size_t i = 0; i < 3; ++i) {
+    // get k1
+    {
+        int32_t err = send_req(clntfd, {"get", "k1"});
+        if (err) goto L_DONE;
+    }
+    // get k2 (not exist)
+    {
+        int32_t err = send_req(clntfd, {"get", "k2"});
+        if (err) goto L_DONE;
+    }
+    // del k1
+    {
+        int32_t err = send_req(clntfd, {"del", "k1"});
+        if (err) goto L_DONE;
+    }
+    // get k1 after del
+    {
+        int32_t err = send_req(clntfd, {"get", "k1"});
+        if (err) goto L_DONE;
+    }
+
+    for (int i = 0; i < 5; ++i) {
         int32_t err = read_res(clntfd);
-        if (err) {
-            goto L_DONE;
-        }
+        if (err) goto L_DONE;
     }
 
 L_DONE:
