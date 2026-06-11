@@ -116,6 +116,23 @@ HNode *hm_pop(
     return NULL;
 }
 
+size_t hm_size(HMap *hmap) {
+    return hmap->ht1.size + hmap->ht2.size;
+}
+
+void h_scan(HTab *tab, void (*f)(HNode *, void *), void *arg) {
+    if (tab->size == 0) {
+        return;
+    }
+    for (size_t i = 0; i < tab->mask + 1; ++i) {
+        HNode *node = tab->tab[i];
+        while (node) {
+            f(node, arg);
+            node = node->next;
+        }
+    }
+}
+
 uint64_t str_hash(const uint8_t *data, size_t len) {
     uint64_t h = 0x811C9DC5;
     for (size_t i = 0; i < len; i++) {

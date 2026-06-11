@@ -30,3 +30,5 @@ uint64_t str_hash(const uint8_t *data, size_t len);
 HNode *hm_lookup(HMap *hmap, HNode *key, bool (*cmp)(HNode *, HNode *));
 void hm_insert(HMap *hmap, HNode *node);
 HNode *hm_pop(HMap *hmap, HNode *key, bool (*cmp)(HNode *, HNode *));
+size_t hm_size(HMap *hmap);
+void h_scan(HTab *tab, void (*f)(HNode *, void *), void *arg);
